@@ -1,5 +1,6 @@
-rollout*.png
-planning_loss.png
+**/rollout*.png
+**/planning_loss.png
+**/weights_player*.txt
 __pycache__/
 __pycache__/*
 .venv/

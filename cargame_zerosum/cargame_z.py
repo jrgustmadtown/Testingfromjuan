@@ -1,3 +1,9 @@
+"""
+Zero-Sum Car Game - Minimax DQN
+
+Two-player zero-sum game where Player 1 (maximizer) and Player 2 (minimizer)
+navigate on a grid. Uses minimax Q-learning: max_a1 min_a2 Q(s,a1,a2)
+"""
 import argparse
 import torch
 import torch.nn as nn
@@ -12,25 +18,32 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 LR = 1e-3
 GRID_SIZE = 5
+STEP_SIZE = 1 / GRID_SIZE  # Each move is a step of this size in [0, 1) space
 GAMMA = 0.9
 TARGET_UPDATE_EVERY = 200
 GRAD_CLIP_NORM = 1.0
 BATCH_SIZE = 32
 MIN_BUFFER_SIZE = 64
 GRADIENT_STEPS = 4
-CRASH_PENALTY = -1
-STAY_PENALTY = -0.5
-LIVING_COST = 0.1
-GRID_REWARD_MAX = 0.5
+# Rewards normalized: scale factor 1/0.9 to get max reward = +1
+# Original ratios preserved: crash:stay:living:grid = 10:5:1:5
+CRASH_PENALTY = -10/9    # -1.111 (was -1)
+STAY_PENALTY = -5/9      # -0.556 (was -0.5)
+LIVING_COST = 1/9        #  0.111 (was 0.1)
+GRID_REWARD_MAX = 5/9    #  0.556 (was 0.5)
 ACTIONS = ['U', 'D', 'L', 'R']
 A = list(range(len(ACTIONS)))
 
 
 def encode_state(s, grid_size):
-    """Normalizes state coordinates for the Neural Network."""
+    """
+    Normalizes state coordinates for the Neural Network.
+    Positions are in [0, 1-STEP_SIZE] space, where each grid cell = STEP_SIZE.
+    """
+    step = 1 / grid_size
     return torch.tensor(
-        [s[0] / (grid_size - 1), s[1] / (grid_size - 1),
-         s[2] / (grid_size - 1), s[3] / (grid_size - 1)],
+        [s[0] * step, s[1] * step,
+         s[2] * step, s[3] * step],
         dtype=torch.float32, device=device
     )
 
@@ -68,6 +81,46 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+def export_weights(net, filepath, player_info=""):
+    """
+    Export network weights in standard format:
+    - W_ij is weight from unit i in previous layer to unit j in next layer
+    - Columns separated by commas, rows by newlines
+    - Layer matrices separated by "-----"
+    """
+    with open(filepath, 'w') as f:
+        layer_idx = 0
+        for name, module in net.net.named_children():
+            if isinstance(module, nn.Linear):
+                # PyTorch stores as (out, in), transpose to get W_ij from i to j
+                W = module.weight.data.cpu().numpy().T
+                b = module.bias.data.cpu().numpy()
+                
+                if layer_idx > 0:
+                    f.write("-----\n")
+                
+                f.write(f"# Layer {layer_idx}: Linear({W.shape[0]} -> {W.shape[1]})\n")
+                f.write("# Weight matrix W (W_ij = weight from unit i to unit j):\n")
+                for row in W:
+                    f.write(",".join(f"{v:.6f}" for v in row) + "\n")
+                
+                f.write("# Bias vector:\n")
+                f.write(",".join(f"{v:.6f}" for v in b) + "\n")
+                
+                layer_idx += 1
+        
+        f.write("-----\n")
+        f.write("# Metadata\n")
+        f.write(f"# Architecture: 4 -> 64 -> 64 -> 16\n")
+        f.write(f"# Activation: ReLU (after layers 0 and 1)\n")
+        f.write(f"# Output: 16 Q-values for joint actions (a1*4 + a2)\n")
+        f.write(f"# Actions: 0=Up, 1=Down, 2=Left, 3=Right\n")
+        if player_info:
+            f.write(f"# {player_info}\n")
+    
+    print(f"Saved weights to {filepath}")
+
+
 def neural_planning(env, iterations=8000):
     """
     Instead of a tabular dictionary, we train the DQN by sampling 
@@ -91,23 +144,36 @@ def neural_planning(env, iterations=8000):
         s_tensor = encode_state(s, env.grid_size)
         
         # 2. Compute Target for all 16 joint actions using the Model (env)
+        # Batched: compute all transitions and rewards, then one forward pass
         with torch.no_grad():
-            target_q_all = torch.zeros(16, device=device)
+            next_states = []
+            rewards = []
+            terminal_mask = []
+            
             for a_idx in range(16):
                 a1, a2 = a_idx // 4, a_idx % 4
-                
                 s_next = env.transition(s, a1, a2)
                 r = env.reward(s, a1, a2)
-                
-                if (s_next[0], s_next[1]) == (s_next[2], s_next[3]):
-                    v_next = 0.0
-                else:
-                    sn_tensor = encode_state(s_next, env.grid_size)
-                    q_next = target_net(sn_tensor).view(4, 4)
-                    # Minimax: Maximize the guaranteed value (min over opponent)
-                    v_next = torch.max(torch.min(q_next, dim=1)[0]).item()
-                
-                target_q_all[a_idx] = r + GAMMA * v_next
+                next_states.append(s_next)
+                rewards.append(r)
+                terminal_mask.append((s_next[0], s_next[1]) == (s_next[2], s_next[3]))
+            
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+            terminal_mask = torch.tensor(terminal_mask, dtype=torch.bool, device=device)
+            
+            # Encode all 16 next states in one batch
+            next_tensors = torch.stack([
+                encode_state(ns, env.grid_size) for ns in next_states
+            ])
+            
+            # One forward pass for all 16 next states
+            q_next_all = target_net(next_tensors).view(16, 4, 4)  # [16, 4, 4]
+            
+            # Minimax: max over a1 of min over a2
+            v_next_all = torch.max(torch.min(q_next_all, dim=2)[0], dim=1)[0]  # [16]
+            v_next_all[terminal_mask] = 0.0
+            
+            target_q_all = rewards + GAMMA * v_next_all
 
         # Store in replay buffer
         replay_buffer.push(s_tensor, target_q_all)
@@ -247,15 +313,20 @@ def draw_trajectory(ax, traj, grid_size, title="", subtitle=""):
                 length_includes_head=True
             )
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Minimax DQN Car Game")
+    parser = argparse.ArgumentParser(description="Zero-Sum Car Game (Minimax DQN)")
     parser.add_argument("--iterations", type=int, default=8000, help="Number of planning iterations")
+    parser.add_argument("--grid-size", type=int, default=5, help="Size of the grid (default: 5)")
     args = parser.parse_args()
 
-    env = CarGame(grid_size=GRID_SIZE)
+    env = CarGame(grid_size=args.grid_size)
 
     # Neural planning
     net, loss = neural_planning(env, iterations=args.iterations)
     policy = get_policy(net, env)
+
+    # Export weights for both players
+    export_weights(net, "weights_player1.txt", "Player 1 (maximizer): argmax over a1 of min over a2")
+    export_weights(net, "weights_player2.txt", "Player 2 (minimizer): opponent uses argmin over a2 given P1's a1")
 
     # Filter to non-crash states (players not at same position)
     valid_states = [s for s in env.states if (s[0], s[1]) != (s[2], s[3])]
@@ -282,7 +353,7 @@ if __name__ == "__main__":
         )
         unique_states = len(set(traj))
 
-        draw_trajectory(ax, traj, GRID_SIZE)
+        draw_trajectory(ax, traj, args.grid_size)
 
         fig.suptitle(
             f"Planning DQN Rollout from {s0}",
