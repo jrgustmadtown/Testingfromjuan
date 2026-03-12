@@ -15,6 +15,9 @@ GRID_SIZE = 5
 GAMMA = 0.9
 TARGET_UPDATE_EVERY = 200
 GRAD_CLIP_NORM = 1.0
+BATCH_SIZE = 32
+MIN_BUFFER_SIZE = 64
+GRADIENT_STEPS = 4
 CRASH_PENALTY = -1
 STAY_PENALTY = -0.5
 LIVING_COST = 0.1
@@ -47,6 +50,24 @@ class DQN(nn.Module):
         return self.net(s)
 
 
+class ReplayBuffer:
+    """Fixed-size buffer to store (state_tensor, target_q) tuples."""
+    def __init__(self, capacity=10000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state_tensor, target_q):
+        self.buffer.append((state_tensor, target_q))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, min(batch_size, len(self.buffer)))
+        states = torch.stack([x[0] for x in batch])
+        targets = torch.stack([x[1] for x in batch])
+        return states, targets
+
+    def __len__(self):
+        return len(self.buffer)
+
+
 def neural_planning(env, iterations=8000):
     """
     Instead of a tabular dictionary, we train the DQN by sampling 
@@ -57,6 +78,7 @@ def neural_planning(env, iterations=8000):
     target_net.load_state_dict(net.state_dict())
     optimizer = optim.Adam(net.parameters(), lr=LR)
     loss_fn = nn.SmoothL1Loss()
+    replay_buffer = ReplayBuffer(capacity=10000)
 
     losses = []
 
@@ -87,22 +109,28 @@ def neural_planning(env, iterations=8000):
                 
                 target_q_all[a_idx] = r + GAMMA * v_next
 
-        # 3. Update the Network
-        q_pred = net(s_tensor)
-        loss = loss_fn(q_pred, target_q_all)
-        
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP_NORM)
-        optimizer.step()
+        # Store in replay buffer
+        replay_buffer.push(s_tensor, target_q_all)
 
-        if (i + 1) % TARGET_UPDATE_EVERY == 0:
-            target_net.load_state_dict(net.state_dict())
+        # 3. Update the Network (sample mini-batch from buffer)
+        if len(replay_buffer) >= MIN_BUFFER_SIZE:
+            for _ in range(GRADIENT_STEPS):
+                batch_states, batch_targets = replay_buffer.sample(BATCH_SIZE)
+                q_pred = net(batch_states)
+                loss = loss_fn(q_pred, batch_targets)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP_NORM)
+                optimizer.step()
 
-        losses.append(loss.item())
+            losses.append(loss.item())
 
-        if i % 1000 == 0:
-            print(f"Planning Step {i} | Loss: {loss.item():.6f}")
+            if (i + 1) % TARGET_UPDATE_EVERY == 0:
+                target_net.load_state_dict(net.state_dict())
+
+        if i % 1000 == 0 and losses:
+            print(f"Planning Step {i} | Loss: {losses[-1]:.6f}")
 
     return net, losses
 
