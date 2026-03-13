@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import nashpy as nash
 import random
 import os
 from collections import deque
@@ -46,6 +47,49 @@ def encode_state(s, grid_size):
          s[2] * step, s[3] * step],
         dtype=torch.float32, device=device
     )
+
+
+def solve_nash(Q1, Q2):
+    """
+    Compute Nash equilibrium for a 4x4 bimatrix game.
+    Q1[a1, a2] = P1's payoff, Q2[a1, a2] = P2's payoff
+    Returns (pi1, pi2) mixed strategies as numpy arrays.
+    Falls back to uniform if no equilibrium found.
+    """
+    Q1_np = Q1.cpu().numpy() if isinstance(Q1, torch.Tensor) else Q1
+    Q2_np = Q2.cpu().numpy() if isinstance(Q2, torch.Tensor) else Q2
+    
+    game = nash.Game(Q1_np, Q2_np)
+    
+    # Try to find Nash equilibrium
+    try:
+        equilibria = list(game.support_enumeration())
+        if equilibria:
+            pi1, pi2 = equilibria[0]
+            return pi1, pi2
+    except:
+        pass
+    
+    # Fallback to uniform
+    uniform = np.ones(4) / 4
+    return uniform, uniform
+
+
+def fast_nash_value(Q1, Q2):
+    """
+    Fast approximation of Nash value using iterated best response.
+    Much faster than solve_nash - used during training.
+    Returns (V1, V2) values at the approximate equilibrium.
+    """
+    a1, a2 = 0, 0
+    for _ in range(3):
+        a1_new = Q1[:, a2].argmax().item()
+        a2_new = Q2[a1, :].argmax().item()
+        if a1_new == a1 and a2_new == a2:
+            break
+        a1, a2 = a1_new, a2_new
+    return Q1[a1, a2], Q2[a1, a2]
+
 
 class DQN(nn.Module):
     """Neural Network that approximates Q(s, a1, a2)."""
@@ -141,7 +185,7 @@ def neural_planning(env, iterations=8000):
     losses1 = []
     losses2 = []
 
-    print("Starting Neural Planning (Independent Learners)...")
+    print("Starting Neural Planning (Nash-Q)...")
     for i in range(iterations):
         # 1. Sample any random state from the environment
         s = random.choice(env.states)
@@ -179,22 +223,11 @@ def neural_planning(env, iterations=8000):
             q1_next_all = target_net1(next_tensors).view(16, 4, 4)  # [16, 4, 4]
             q2_next_all = target_net2(next_tensors).view(16, 4, 4)  # [16, 4, 4]
             
-            # Get greedy actions from current networks (for opponent modeling)
-            q1_current = net1(next_tensors).view(16, 4, 4)
-            q2_current = net2(next_tensors).view(16, 4, 4)
-            
-            # P1 greedy: argmax_a1 of max_a2 Q1 (best a1 assuming best response)
-            # P2 greedy: argmax_a2 of max_a1 Q2 (best a2 assuming best response)
-            a1_greedy = q1_current.max(dim=2)[0].argmax(dim=1)  # [16]
-            a2_greedy = q2_current.max(dim=1)[0].argmax(dim=1)  # [16]
-            
-            # V1(s') = max_a1 Q1(s', a1, π2(s')) - P1 picks best given P2's greedy
-            # V2(s') = max_a2 Q2(s', π1(s'), a2) - P2 picks best given P1's greedy
+            # Fast Nash approximation via iterated best response
             v1_next = torch.zeros(16, device=device)
             v2_next = torch.zeros(16, device=device)
             for idx in range(16):
-                v1_next[idx] = q1_next_all[idx, :, a2_greedy[idx]].max()
-                v2_next[idx] = q2_next_all[idx, a1_greedy[idx], :].max()
+                v1_next[idx], v2_next[idx] = fast_nash_value(q1_next_all[idx], q2_next_all[idx])
             
             v1_next[terminal_mask] = 0.0
             v2_next[terminal_mask] = 0.0
@@ -287,14 +320,11 @@ def get_policy(nets, env):
         with torch.no_grad():
             q1 = net1(s_t).view(4, 4)
             q2 = net2(s_t).view(4, 4)
-        # Iterate to find mutual best response
-        a1, a2 = 0, 0
-        for _ in range(3):
-            a1_new = q1[:, a2].argmax().item()
-            a2_new = q2[a1, :].argmax().item()
-            if a1_new == a1 and a2_new == a2:
-                break
-            a1, a2 = a1_new, a2_new
+        # Compute Nash equilibrium
+        pi1, pi2 = solve_nash(q1, q2)
+        # Pick highest probability action (deterministic from mixed)
+        a1 = int(np.argmax(pi1))
+        a2 = int(np.argmax(pi2))
         policy[s] = (lambda a=a1: a, lambda a=a2: a)
     return policy
 
@@ -361,7 +391,7 @@ def draw_trajectory(ax, traj, grid_size, title="", subtitle=""):
                 length_includes_head=True
             )
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="General-Sum Car Game (Independent Learners)")
+    parser = argparse.ArgumentParser(description="General-Sum Car Game (Nash-Q)")
     parser.add_argument("--iterations", type=int, default=8000, help="Number of planning iterations")
     parser.add_argument("--grid-size", type=int, default=5, help="Size of the grid (default: 5)")
     args = parser.parse_args()
@@ -375,8 +405,8 @@ if __name__ == "__main__":
     policy = get_policy(nets, env)
 
     # Export weights for both players
-    export_weights(net1, "weights_player1.txt", "Player 1 Q-network (independent learner)")
-    export_weights(net2, "weights_player2.txt", "Player 2 Q-network (independent learner)")
+    export_weights(net1, "weights_player1.txt", "Player 1 Q-network (Nash-Q)")
+    export_weights(net2, "weights_player2.txt", "Player 2 Q-network (Nash-Q)")
 
     # Plot loss curves
     plt.figure()
@@ -384,7 +414,7 @@ if __name__ == "__main__":
     plt.plot(losses2, label="P2 Loss", alpha=0.7)
     plt.xlabel("Update Step")
     plt.ylabel("Loss")
-    plt.title("Independent Learners Training Loss")
+    plt.title("Nash-Q Training Loss")
     plt.legend()
     plt.savefig("planning_loss.png")
     plt.close()
